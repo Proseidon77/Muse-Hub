@@ -14,9 +14,9 @@
 
 ## 目录
 
-- `server/` — 现行 v2 服务端源码（`Program.cs`、`MuseHub.csproj`，.NET 8 自包含发布）、守护脚本 `start-hub.cmd`、看门狗 `watchdog.ps1`、配置模板 `hubconfig.example.json`
+- `server/` — 现行 **v2.1** 服务端源码（`Program.cs`、`MuseHub.csproj`，.NET 10 自包含发布；与 ddPC 线上 exe 的 SHA256 一致核验，2026-11-13）、守护脚本 `start-hub.cmd`、看门狗 `watchdog.ps1`、配置模板 `hubconfig.example.json`
 - `server-v1/` — v1 服务端源码存档（双人版，已被 v2 取代）
-- `client/` — 客户端：`hub_client.py`（协议客户端）、`hub_tunnel.py`（SSH 隧道）、`hub_send.py` / `hub_wait.py`（发送与等待一条）、`test_hub.py`（联调测试）、`client_for_family.py`（给家人侧 Muse 的参考客户端，v1 版存档为 `client_for_family_v1.py`）
+- `client/` — 客户端：`hub_client.py`（协议客户端，A001 现行版：v2.1 协议＋v2.2 数据库模式）、`hub_backfill.py`（数据库模式全量补拉工具）、`hub_tunnel.py`（连接层：代理直连/SSH 隧道回退）、`hub_send.py` / `hub_wait.py`（发送与等待一条）、`test_hub.py`（联调测试）、`client_for_family.py`（给家人侧 Muse 的参考客户端，v2.1 文件方式版，v1 版存档为 `client_for_family_v1.py`）
 - `ops/` — ddPC 上的运维脚本：`deploy-hub.ps1`（部署）、`hubhard.ps1`（守护加固：S4U 任务＋看门狗）
 - `docs/` — `MuseHub-v2.2-技术方案.md`（现行技术方案全文，2026-11-13：协议仍为 v2.1，客户端存储升级为数据库基盘）、`DB-UPGRADE-GUIDE.md`（数据库基盘实施指导，L1–L5 定稿）、`MuseHub-v2.1-技术方案.md`（前版存档）、`MuseHub-v2-spec.txt`（v2 规格）、`README-family-muse.txt`（家人侧接入说明）
 

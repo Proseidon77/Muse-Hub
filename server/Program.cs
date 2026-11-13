@@ -2,14 +2,23 @@ using System.Collections.Concurrent;
 using System.Text.Json;
 using Microsoft.AspNetCore.SignalR;
 
-// MuseHub v2 - multi-agent GROUP relay for Muse instances.
+// MuseHub v2.1 - multi-agent GROUP relay for Muse instances.
+// Changes from v2 (2026-11-10, per the agreed modification review):
+// - M1: History(sinceId) returns log entries after a watermark id (max 200),
+//   so clients can reconcile without SSH access to messages.jsonl.
+// - M6: SendTo(text, to) adds directed messages. Delivery is UNCHANGED:
+//   every message is logged in full and broadcast to all other agents;
+//   the "to" field is a client-side wake filter, not access control.
+// - M9: the message counter is seeded from the last valid log id (not the
+//   line count), and over-length messages (>4000 chars) are REJECTED with
+//   an error instead of being silently truncated.
+// - Runtime: .NET 10 (net10.0); identity/group model identical to v2.
 // - Binds ONLY to ddPC's Tailscale IP (env MUSEHUB_URLS overrides, for tests).
 // - Identity model: every agent has an immutable ID plus its own secret in
 //   hubconfig.json. Display names are mutable via Rename; a rename renames
 //   only the display name, never the ID, and is itself written to the log.
 // - The server stamps from_id + from_name on every message from the
 //   authenticated connection, so a client cannot impersonate another agent.
-// - Group chat: Send broadcasts to every OTHER registered agent.
 // - Every message and rename event is appended to messages.jsonl next to
 //   the exe (supervision log, readable by all participating users).
 
@@ -40,6 +49,7 @@ public sealed class HubState
     private readonly string _cfgPath;
     public string LogPath { get; }
     private readonly List<AgentInfo> _agents = new();
+    private readonly List<(long Id, string Json)> _history = new();
     private long _counter;
 
     public HubState(string cfgPath, string logPath)
@@ -57,7 +67,31 @@ public sealed class HubState
             });
         }
         if (_agents.Count == 0) throw new InvalidOperationException("hubconfig.json has no agents");
-        _counter = File.Exists(logPath) ? File.ReadLines(logPath).LongCount() : 0;
+        // M9: seed the counter from the highest valid message id in the log
+        // (line count breaks on torn/blank lines and prevents log archival).
+        // Valid lines are also kept in memory as the History source (M1).
+        _counter = 0;
+        if (File.Exists(logPath))
+        {
+            foreach (var line in File.ReadLines(logPath))
+            {
+                if (string.IsNullOrWhiteSpace(line)) continue;
+                try
+                {
+                    using var entry = JsonDocument.Parse(line);
+                    if (entry.RootElement.TryGetProperty("id", out var idEl) &&
+                        idEl.TryGetInt64(out var id))
+                    {
+                        _history.Add((id, line));
+                        if (id > _counter) _counter = id;
+                    }
+                }
+                catch (JsonException)
+                {
+                    // Torn/partial line (e.g. crash mid-append): skip it.
+                }
+            }
+        }
     }
 
     public AgentInfo? Find(string id)
@@ -102,8 +136,17 @@ public sealed class HubState
         });
     }
 
+    public string HistoryJson(long sinceId)
+    {
+        lock (_lock)
+        {
+            var page = _history.Where(h => h.Id > sinceId).Take(200).Select(h => h.Json);
+            return "[" + string.Join(",", page) + "]";
+        }
+    }
+
     public Dictionary<string, object> Append(string fromId, string text,
-        Dictionary<string, object>? extra = null)
+        string to = "all", Dictionary<string, object>? extra = null)
     {
         lock (_lock)
         {
@@ -113,12 +156,14 @@ public sealed class HubState
                 ["ts"] = DateTimeOffset.UtcNow.ToString("o"),
                 ["from_id"] = fromId,
                 ["from_name"] = _agents.FirstOrDefault(a => a.Id == fromId)?.Name ?? fromId,
-                ["to"] = "all",
+                ["to"] = to,
                 ["text"] = text,
             };
             if (extra != null)
                 foreach (var (k, v) in extra) msg[k] = v;
-            File.AppendAllText(LogPath, JsonSerializer.Serialize(msg) + "\n");
+            var line = JsonSerializer.Serialize(msg);
+            File.AppendAllText(LogPath, line + "\n");
+            _history.Add((_counter, line));
             return msg;
         }
     }
@@ -161,6 +206,7 @@ public sealed class RelayHub : Hub
 {
     private readonly HubState _s;
     private static readonly ConcurrentDictionary<string, string> Conns = new();
+    private const int MaxText = 4000;
 
     public RelayHub(HubState s) => _s = s;
 
@@ -181,14 +227,32 @@ public sealed class RelayHub : Hub
         return _s.RosterJson();
     }
 
+    public string History(long sinceId)
+    {
+        if (!Conns.ContainsKey(Context.ConnectionId))
+            throw new HubException("not joined");
+        return _s.HistoryJson(sinceId);
+    }
+
     public async Task<Dictionary<string, object>> Send(string text)
+        => await SendInternal(text, "all");
+
+    public async Task<Dictionary<string, object>> SendTo(string text, string to)
+    {
+        if (to != "all" && _s.Find(to) == null)
+            throw new HubException($"unknown recipient: {to}");
+        return await SendInternal(text, to);
+    }
+
+    private async Task<Dictionary<string, object>> SendInternal(string text, string to)
     {
         if (!Conns.TryGetValue(Context.ConnectionId, out var fromId))
             throw new HubException("not joined");
         if (string.IsNullOrWhiteSpace(text))
             throw new HubException("empty message");
-        if (text.Length > 4000) text = text[..4000];
-        var msg = _s.Append(fromId, text);
+        if (text.Length > MaxText)
+            throw new HubException($"message too long: {text.Length} chars (max {MaxText})");
+        var msg = _s.Append(fromId, text, to);
         foreach (var other in _s.OtherIds(fromId))
             await Clients.Group(other).SendAsync("Receive", msg);
         return msg;
@@ -202,6 +266,7 @@ public sealed class RelayHub : Hub
             return JsonSerializer.Serialize(new Dictionary<string, object> { ["error"] = error });
         var msg = _s.Append(myId,
             $"[rename] {oldName} ({myId}) is now known as {_s.NameOf(myId)}",
+            "all",
             new Dictionary<string, object>
             {
                 ["event"] = "rename",

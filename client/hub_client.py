@@ -34,14 +34,68 @@ Local side files (per agent, next to this script unless overridden):
   hub_received_<ID>.jsonl  - local copy of everything received (tamper check)
   hub_state_<ID>.json      - roster cache + watermark + last sent id
   hub_wait_diag.log        - drop/reconnect diagnostics (never wakes the agent)
+
+Database mode (per DB-UPGRADE-GUIDE.md, 2026-11-13; opt-in, default off):
+  Enabled by env HUB_DB_MODE=1 or a flag file hub_db_<ID>.on next to this
+  script. Entries go to table hub_msg in the local PostgreSQL database
+  "musehub" (one row per server id; wake = pending/done/none separates
+  "stored" from "printed", so a kill can only reprint, never lose).
+  No watermark is kept in DB mode: catch-up over-pulls one page (200)
+  before max(id) and dedups by primary key. If the database is
+  unreachable the client prints HUB_STATE_DEGRADED once and falls back
+  to the file behaviour above for the rest of the process.
+  Extra CLI mode: backfill (DB mode only) pulls the full History into
+  hub_msg without printing.
 """
-import argparse, json, os, sys, time, urllib.request
+import argparse, base64, json, os, subprocess, sys, time, urllib.request
 
 RS = "\x1e"
 TOOLS_DIR = os.path.dirname(os.path.abspath(__file__))
 DEAD_AFTER = 45.0          # seconds without any inbound frame -> dead (M4)
 GIVE_UP_AFTER = 600.0      # seconds of continuous failure -> exit 4 (M3)
 COLLECT_WINDOW = 2.5       # seconds to batch burst messages into one wake (M2)
+OVERPULL = 200             # DB mode catch-up over-pull (one History page)
+DB_PW_DEFAULT = os.path.expanduser("~/workspace/musehub/musehub_owner.pw")
+
+
+def _pw_file():
+    """Password file for the musehub db. HUB_DB_PW_FILE may override it,
+    but an override pointing at a missing file (e.g. a stale value left
+    in some shell's environment) must not defeat the real default."""
+    p = os.environ.get("HUB_DB_PW_FILE")
+    if p and os.path.exists(p):
+        return p
+    return DB_PW_DEFAULT
+PGSH = os.path.expanduser("~/workspace/postgres/pg.sh")
+
+
+class DBDown(Exception):
+    """The local musehub database could not be reached or used."""
+
+
+def _db_sql(sql, tuples=False):
+    """Run SQL against db "musehub" as musehub_owner via pg.sh psql
+    (the house pattern: no driver, password from the .pw file).
+    Returns stdout text; raises DBDown on any failure."""
+    try:
+        with open(_pw_file(), encoding="utf-8") as f:
+            pw = f.read().strip()
+    except Exception as e:
+        raise DBDown(f"password file unreadable: {e}")
+    env = dict(os.environ)
+    env["PGPASSWORD"] = pw
+    args = [PGSH, "psql", "-U", "musehub_owner", "-d", "musehub",
+            "-X", "-q", "-v", "ON_ERROR_STOP=1"]
+    if tuples:
+        args += ["-A", "-t", "-F", "\x1f"]
+    try:
+        r = subprocess.run(args, input=sql, capture_output=True, text=True,
+                           env=env, timeout=30)
+    except Exception as e:
+        raise DBDown(str(e))
+    if r.returncode != 0:
+        raise DBDown((r.stderr or r.stdout or "psql failed").strip()[:200])
+    return r.stdout
 
 
 class ConnectionLost(Exception):
@@ -73,6 +127,20 @@ class Hub:
         self.diag_log = os.path.join(TOOLS_DIR, "hub_wait_diag.log")
         self.state = self._load_state()
         self.watermark = self.state.get("watermark", 0)
+        # Database mode (opt-in; see module docstring). Probed once here;
+        # any later DB failure degrades to file mode via _db_degrade().
+        self.db_on = False
+        self._deferred = []        # Receive frames buffered during invokes (F3)
+        self._startup_sync = False
+        if self._db_requested():
+            try:
+                _db_sql("SELECT 1")
+                self.db_on = True
+                self._startup_sync = True
+            except DBDown as e:
+                print(f"HUB_STATE_DEGRADED: database unavailable ({e}); "
+                      f"using file state", file=sys.stderr, flush=True)
+                self._diag(f"db mode requested but unavailable: {e}; file mode")
         # Optional hook called before every reconnect attempt inside
         # wait_message (e.g. to restart a dead SSH tunnel first, so the
         # reconnect unit is "transport + Join", not just the WebSocket).
@@ -115,6 +183,93 @@ class Hub:
         except Exception:
             pass
         self.ws = None
+
+    # ---------- database mode ----------
+    def _db_requested(self):
+        if os.environ.get("HUB_DB_MODE", "").lower() in ("1", "true", "yes"):
+            return True
+        return os.path.exists(os.path.join(
+            TOOLS_DIR, f"hub_db_{self.agent_id}.on"))
+
+    def _db_degrade(self, e):
+        if self.db_on:
+            print(f"HUB_STATE_DEGRADED: database lost ({e}); "
+                  f"using file state", file=sys.stderr, flush=True)
+        self.db_on = False
+        self._diag(f"db degraded: {e}")
+
+    def _db_insert(self, entries, force_wake=None):
+        """Insert entries into hub_msg (PK dedup). Returns the sublist of
+        entries newly inserted as wake='pending'. Raises DBDown.
+        During the startup sync, entries at or below the file watermark
+        are marked 'done' (they were printed in a file-mode period)."""
+        rows, pending = [], []
+        for e in entries:
+            if not isinstance(e, dict) or e.get("id") is None:
+                continue
+            if force_wake is not None:
+                wake = force_wake
+            elif self._startup_sync and e["id"] <= self.state.get("watermark", 0):
+                wake = "done"
+            else:
+                wake = "pending" if self._entry_wakes(e) else "none"
+            raw = json.dumps(e, ensure_ascii=False)
+            b64 = base64.b64encode(raw.encode("utf-8")).decode()
+            rows.append(f"({int(e['id'])}, convert_from(decode('{b64}',"
+                        f"'base64'),'UTF8')::jsonb, '{wake}')")
+            if wake == "pending":
+                pending.append(e)
+        if not rows:
+            return []
+        out = _db_sql("INSERT INTO hub_msg (id, entry, wake) VALUES "
+                      + ", ".join(rows)
+                      + " ON CONFLICT (id) DO NOTHING RETURNING id;", tuples=True)
+        new_ids = {int(x) for x in out.split() if x.strip()}
+        return [e for e in pending if e["id"] in new_ids]
+
+    def _db_max_id(self):
+        out = _db_sql("SELECT COALESCE(MAX(id), 0) FROM hub_msg;", tuples=True)
+        return int(out.strip() or 0)
+
+    def _db_count(self):
+        out = _db_sql("SELECT count(*) FROM hub_msg;", tuples=True)
+        return int(out.strip() or 0)
+
+    def _db_pending(self):
+        out = _db_sql("SELECT entry::text FROM hub_msg "
+                      "WHERE wake='pending' ORDER BY id;", tuples=True)
+        return [json.loads(line) for line in out.splitlines() if line.strip()]
+
+    def _db_mark_done(self, ids):
+        if not ids:
+            return
+        idlist = ", ".join(str(int(i)) for i in ids)
+        _db_sql(f"UPDATE hub_msg SET wake='done', printed_at=now() "
+                f"WHERE wake='pending' AND id IN ({idlist});")
+
+    def _flush_deferred(self, batch):
+        if self._deferred:
+            pending, self._deferred = self._deferred, []
+            batch.extend(self._process(pending))
+
+    def backfill(self):
+        """DB mode only: pull the full History into hub_msg, insert-only,
+        never prints. Returns how many rows were newly inserted."""
+        if not self.db_on:
+            raise SystemExit("backfill needs database mode and a reachable "
+                             "database (HUB_DB_MODE=1 or the flag file)")
+        total_new, since = 0, 0
+        while True:
+            entries = self.get_history(since)
+            if not entries:
+                break
+            before = self._db_count()
+            self._db_insert(entries, force_wake="none")
+            total_new += self._db_count() - before
+            if len(entries) < 200:
+                break
+            since = entries[-1]["id"]
+        return total_new
 
     # ---------- local side files ----------
     def _load_state(self):
@@ -175,6 +330,15 @@ class Hub:
 
     def _wait_for(self, pred, timeout=20):
         for m in self._frames(timeout):
+            if (self.db_on and m.get("type") == 1
+                    and m.get("target") == "Receive"):
+                # F3: never drop a push that arrives while an invoke is
+                # in flight; it is processed after the invoke returns.
+                try:
+                    self._deferred.append(m["arguments"][0])
+                except Exception:
+                    pass
+                continue
             if pred(m):
                 return m
         raise SystemExit("timed out waiting for hub response")
@@ -208,6 +372,11 @@ class Hub:
         if isinstance(res, dict) and "id" in res:
             self.state["last_sent_id"] = res["id"]
             self._save_state()
+            if self.db_on:
+                try:
+                    self._db_insert([res], force_wake="none")
+                except DBDown as e:
+                    self._db_degrade(e)
 
     def send_message(self, text, to=None):
         target = "SendTo" if to else "Send"
@@ -272,7 +441,14 @@ class Hub:
 
     def _process(self, entries):
         """Record entries, advance the watermark, return the waking batch.
-        The watermark is persisted by the caller only after printing."""
+        The watermark is persisted by the caller only after printing.
+        In DB mode the entries go to hub_msg instead and the return value
+        is the newly inserted pending entries."""
+        if self.db_on:
+            try:
+                return self._db_insert(entries)
+            except DBDown as e:
+                self._db_degrade(e)  # fall through to the file path below
         batch = []
         for e in entries:
             self._record_local(json.dumps(e, ensure_ascii=False))
@@ -284,6 +460,30 @@ class Hub:
         return batch
 
     def _print_batch(self, batch):
+        if self.db_on:
+            try:
+                rows = self._db_pending()
+            except DBDown as e:
+                self._db_degrade(e)
+                rows = None
+            if rows is not None:
+                for e in rows:
+                    out = {k: e.get(k) for k in ("id", "ts", "from_id", "from_name", "to", "text")
+                           if k in e}
+                    print(json.dumps(out, ensure_ascii=False), flush=True)
+                if rows:
+                    try:
+                        self._db_mark_done([e["id"] for e in rows])
+                    except DBDown as e:
+                        # Printed but unmarked: they will reprint next
+                        # time (the safe direction, never a loss).
+                        self._db_degrade(e)
+                    # Shadow file watermark (printed-up-to) so a later
+                    # file-mode fallback resumes at the right place.
+                    self.watermark = max(
+                        self.watermark, max(e["id"] for e in rows))
+                    self._save_state()
+                return
         for e in batch:
             out = {k: e.get(k) for k in ("id", "ts", "from_id", "from_name", "to", "text")
                    if k in e}
@@ -292,13 +492,24 @@ class Hub:
 
     def _catch_up(self):
         """Pull everything after the watermark via History (M1/M2).
-        Returns the waking batch. Raises ConnectionLost on transport trouble."""
+        Returns the waking batch. Raises ConnectionLost on transport trouble.
+        In DB mode there is no watermark: pull from max(id) - OVERPULL and
+        let the primary key dedup; any rows still pending afterwards (e.g.
+        left by a killed run) become the batch so they get printed."""
         if self._no_history:
             return []
         batch = []
+        if self.db_on:
+            try:
+                since = max(0, self._db_max_id() - OVERPULL)
+            except DBDown as e:
+                self._db_degrade(e)
+                since = self.watermark
+        else:
+            since = self.watermark
         while True:
             try:
-                entries = self.get_history(self.watermark)
+                entries = self.get_history(since)
             except SystemExit as e:
                 if "History error" in str(e):
                     self._no_history = True  # pre-v2.1 server: no catch-up
@@ -306,8 +517,19 @@ class Hub:
                     return batch
                 raise ConnectionLost(str(e))
             batch.extend(self._process(entries))
+            if self.db_on:
+                self._flush_deferred(batch)
             if len(entries) < 200:
+                if self.db_on:
+                    self._startup_sync = False
+                    try:
+                        pend = self._db_pending()
+                        if pend:
+                            batch = pend
+                    except DBDown:
+                        pass
                 return batch
+            since = entries[-1]["id"] if self.db_on else self.watermark
 
     # ---------- wait (M2 + M3 + M4) ----------
     def _listen_once(self, stay, deadline):
@@ -317,12 +539,18 @@ class Hub:
         last_ping = 0.0
         batch = []
         collect_until = None
+        if self.db_on:
+            self._flush_deferred(batch)
+            if batch:
+                got += len(batch)
+                if not stay and collect_until is None:
+                    collect_until = time.time() + COLLECT_WINDOW
         while time.time() < deadline:
             for m in self._frames(5):
                 if m.get("type") == 1 and m.get("target") == "Receive":
                     e = m["arguments"][0]
                     eid = e.get("id") if isinstance(e, dict) else None
-                    if eid is not None and eid <= self.watermark:
+                    if not self.db_on and eid is not None and eid <= self.watermark:
                         continue  # already handled by catch-up (exact-id dedup)
                     woke = self._process([e])
                     if woke:
@@ -330,7 +558,8 @@ class Hub:
                         got += len(woke)
                         if not stay and collect_until is None:
                             collect_until = time.time() + COLLECT_WINDOW
-                    self._save_state()  # keep the watermark crash-safe
+                    if not self.db_on:
+                        self._save_state()  # keep the watermark crash-safe
             if collect_until is not None and time.time() >= collect_until:
                 self._print_batch(batch)
                 return 0
@@ -400,7 +629,7 @@ def main():
     ap.add_argument("--secret", default=os.environ.get("HUB_SECRET", ""))
     ap.add_argument("--stay", action="store_true")
     ap.add_argument("--to", default=None, help="send mode only: directed recipient ID (SendTo)")
-    ap.add_argument("mode", choices=["send", "wait", "rename", "roster"])
+    ap.add_argument("mode", choices=["send", "wait", "rename", "roster", "backfill"])
     ap.add_argument("text", nargs="?", default="")
     a = ap.parse_intermixed_args()  # allow options after the mode, e.g. send --to A001 "text"
     if not a.secret:
@@ -414,6 +643,11 @@ def main():
         return 0
     if a.mode == "roster":
         print(json.dumps(hub.get_roster(), ensure_ascii=False))
+        return 0
+    if a.mode == "backfill":
+        n = hub.backfill()
+        print(json.dumps({"backfilled_new": n, "total": hub._db_count()},
+                         ensure_ascii=False))
         return 0
     return hub.wait_message(stay=a.stay)
 
