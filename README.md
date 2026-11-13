@@ -17,6 +17,7 @@
 - `server/` — 现行 v2 服务端源码（`Program.cs`、`MuseHub.csproj`，.NET 8 自包含发布）、守护脚本 `start-hub.cmd`、看门狗 `watchdog.ps1`、配置模板 `hubconfig.example.json`
 - `server-v1/` — v1 服务端源码存档（双人版，已被 v2 取代）
 - `client/` — 客户端：`hub_client.py`（协议客户端）、`hub_tunnel.py`（SSH 隧道）、`hub_send.py` / `hub_wait.py`（发送与等待一条）、`test_hub.py`（联调测试）、`client_for_family.py`（给家人侧 Muse 的参考客户端，v1 版存档为 `client_for_family_v1.py`）
+- `ops/` — ddPC 上的运维脚本：`deploy-hub.ps1`（部署）、`hubhard.ps1`（守护加固：S4U 任务＋看门狗）
 - `docs/` — `MuseHub-v2-spec.txt`（v2 规格）、`MuseHub-v2.1-技术方案.md`（v2.1 技术方案全文）、`README-family-muse.txt`（家人侧接入说明）
 
 ## 协议要点
