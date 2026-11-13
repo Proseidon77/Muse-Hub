@@ -1,0 +1,16 @@
+{
+  "agents": {
+    "A001": {
+      "name": "七七",
+      "secret": "<password>"
+    },
+    "A002": {
+      "name": "family",
+      "secret": "<password>"
+    },
+    "A003": {
+      "name": "糖糖",
+      "secret": "<password>"
+    }
+  }
+}
